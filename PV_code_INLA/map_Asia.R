@@ -1,0 +1,170 @@
+library(foreach)
+library(doParallel)
+
+registerDoParallel(25)
+
+pacman::p_load(ggplot2, spData, sp, sf, raster,writexl,data.table,readxl,INLA)
+
+### set output file names, dirs etc
+df_allgridcells				<- '/vol/milkunB/jbosmans/PV_Konrad_Asia/df_Asia_allgridcells.csv'
+dir_Konrad 						<- '/vol/milkunarc2/kmielke/pv' 
+load(file = file.path(dir_Konrad,'/data/rda/df_PA_Asia_country_060622_proprocessed_updated.Rda'))
+
+### load
+print('loading dataframe with all grid cells')
+df_full <- read.csv(df_allgridcells)
+
+### load the model performance file
+model_performance <- read.csv(file.path(dir_Konrad,'/results/waic_AsiaRev_updated.txt'), sep = ' ', header = FALSE)
+best_model <- model_performance[which.min(model_performance$V2), 1]
+
+### create a stack of data used for fitting, based on df_PA (presences and absences, not all grid cells)
+
+# create matrix of coordinate pairs and ranges
+coords     = cbind(df_PA$x_coord, df_PA$y_coord)
+x_range    = max(coords[,1]) - min(coords[,1])
+y_range    = max(coords[,2]) - min(coords[,2])
+mean_range = (x_range + y_range)/2
+
+# create mesh and helping structure A
+mesh <- inla.mesh.2d(loc = coords, max.edge=c(1,2)*mean_range/5, cutoff = c(mean_range/25))
+A    <- inla.spde.make.A(mesh=mesh,loc=as.matrix(coords))
+
+# create spatial structure spde, and helping structure iset, set seed
+spde <- inla.spde2.matern(mesh, alpha=1.5)
+iset <- inla.spde.make.index(name = "spatial.field", spde$n.spde)
+
+# use df_PA as train data and create stack used for fitting (df_full will be used for stk.pred)
+trainFrame <- df_PA
+stk.fit <- inla.stack(data=list(y = as.integer(trainFrame$PA_bool, n = length(trainFrame$PA_bool))),
+                            effects=list(c(list(Intercept=1), iset),
+                                           list(SOVEREIGN1 = trainFrame$SOVEREIGN1,
+                                                travel_log = trainFrame$travel_log,
+                                                slope_log = trainFrame$slope_log,
+                                                elev_log = trainFrame$elev_log,
+                                                road_log = trainFrame$road_log,
+                                                grid_log = trainFrame$grid_log,
+                                                rsds = trainFrame$rsds,
+                                                protect = trainFrame$protect,
+                                                Agriculture = trainFrame$Agriculture,
+                                                Short_natural = trainFrame$Short_natural,
+                                                Wetland = trainFrame$Wetland,
+                                                Urban = trainFrame$Urban,
+                                                Bare = trainFrame$Bare,
+                                                Water = trainFrame$Water
+                                        )
+                                    ), 
+                            A=list(A,1),
+                            tag='fit')
+
+### create a stack of data used for predicting, based on df_full# create matrix of coordinate pairs and ranges
+
+# first do coordinate transformation
+d               <- data.frame(lon=df_full$lon_orig, lat=df_full$lat_orig)
+coordinates(d)  <- c("lon", "lat")
+proj4string(d)  <- CRS("+init=epsg:4326") # WGS 84
+CRS.new         <- CRS("ESRI:102030") # Lambert projection
+d_transformed   <- spTransform(d, CRS.new)
+df_full$x_coord <- d_transformed$lon
+df_full$y_coord <- d_transformed$lat
+
+# log-transform a subset of variables and normalize all (from /vol/milkunarc2/kmielke/pv/code/preprocessing_Eur.R)
+df_full$travel_log <- log10(df_full$access + 1)
+df_full$slope_log  <- log10(df_full$slope)
+df_full$elev_log   <- log10(df_full$elev + abs(min(df_full$elev))+1)
+df_full$road_log   <- log10(df_full$road_dist + 1)
+df_full$grid_log   <- log10(df_full$grid_km + 1)
+
+df_full$travel_log    <- (df_full$travel_log - mean(df_full$travel_log))/sd(df_full$travel_log)
+df_full$slope_log     <- (df_full$slope_log - mean(df_full$slope_log))/sd(df_full$slope_log)
+df_full$elev_log      <- (df_full$elev_log - mean(df_full$elev_log))/sd(df_full$elev_log)
+df_full$road_log      <- (df_full$road_log - mean(df_full$road_log))/sd(df_full$Sroad_log)
+df_full$rsds          <- (df_full$rsds - mean(df_full$rsds))/sd(df_full$rsds)
+df_full$protect       <- (df_full$protect - mean(df_full$protect))/sd(df_full$protect)
+df_full$Agriculture   <- (df_full$Agriculture - mean(df_full$Agriculture))/sd(df_full$Agriculture)
+df_full$Short_natural <- (df_full$Short_natural - mean(df_full$Short_natural))/sd(df_full$Short_natural)
+df_full$Wetland       <- (df_full$Wetland - mean(df_full$Wetland))/sd(df_full$Wetland)
+df_full$Urban         <- (df_full$Urban - mean(df_full$Urban))/sd(df_full$Urban)
+df_full$Bare          <- (df_full$Bare - mean(df_full$Bare))/sd(df_full$Bare)
+df_full$Water         <- (df_full$Water - mean(df_full$Water))/sd(df_full$Water)
+
+# number of data points per run
+perRun <- 10000
+nRuns <- ceiling(nrow(df_full)/perRun)
+
+print('starting loop')
+print(nRuns)
+# loop over all runs
+foreach(i = 1:nRuns) %dopar% {
+
+    # create a copy so that df_full is not overridden with subframe (not sure whether this is necessary, but to be sure)
+    df_full_temp <- cbind(df_full)
+    
+    # take the data points for the run
+    if (i * perRun < nrow(df_full)) {
+        df_full_temp <- df_full_temp[(1 + (i-1)*perRun):(i*perRun),]
+    } else {
+        df_full_temp <- df_full_temp[(1 + (i-1)*perRun):(nrow(df_full)),]
+    }
+    
+    # set coordinates 
+    coords_full     = cbind(df_full_temp$x_coord, df_full_temp$y_coord)
+
+    # create mesh and helping structure A
+    A_full    <- inla.spde.make.A(mesh=mesh,loc=as.matrix(coords_full))
+
+    # use df_full as test data and create stack used for predicting. Using iset and A_full
+    testFrame <- df_full_temp
+    testFrame$PA_bool <- rep(NA, length(testFrame[,1]))
+    stk.pred <- inla.stack(data=list(y = testFrame$PA_bool),
+                            effects=list(c(list(Intercept=1), iset),
+                                           list(SOVEREIGN1 = testFrame$SOVEREIGN1,
+                                                travel_log = testFrame$travel_log,
+                                                slope_log = testFrame$slope_log,
+                                                elev_log = testFrame$elev_log,
+                                                road_log = testFrame$road_log,
+                                                grid_log = testFrame$grid_log,
+                                                rsds = testFrame$rsds,
+                                                protect = testFrame$protect,
+                                                Agriculture = testFrame$Agriculture,
+                                                Short_natural = testFrame$Short_natural,
+                                                Wetland = testFrame$Wetland,
+                                                Urban = testFrame$Urban,
+                                                Bare = testFrame$Bare,
+                                                Water = testFrame$Water
+                                        )
+                                    ), 
+                            A=list(A_full,1),
+                            tag='pred')
+
+
+    # stk.full has stk.fit and stk.pred
+    stk.full <- inla.stack(stk.fit, stk.pred)
+
+    # using predictors from the best model (see Script_find_best_model.R)
+    formula <- y ~ 1 + travel_log + slope_log + elev_log + road_log + grid_log + rsds + protect + Agriculture + Short_natural + Wetland + Urban + Bare + Water + f(SOVEREIGN1, model = "iid") + f(spatial.field, model = spde)
+
+    # set seed
+    set.seed(model_performance[model_performance[,1] == best_model, 3])
+
+    # build the model - this overwrites the model loaded from the Rda file? (best model found through Script_find_best_model.R?)
+    model <-inla(formula,
+                    data=inla.stack.data(stk.full,spde=spde), # data plus spde
+                    family= 'binomial', # data family
+                    control.family = list(link = "logit"), # logit for logistic regression
+                    control.predictor=list(link = 1, A=inla.stack.A(stk.full)), # calculate the covariate weights
+                    control.compute = list(waic = TRUE) # calculate Watanabe-Akaike information criterion 
+                    )
+         
+    # save the model
+    save(model, file = paste0(dir_Konrad, "/models/Asia_predictions/", toString(i), ".Rda"))
+
+    # get the predictions - use tag = pred?
+    index       <- inla.stack.index(stack = stk.full, tag = "pred")$data
+    predictions <- model$summary.fitted.values[index, "mean"]
+    df_full_temp$prediction <- predictions
+
+    # save the predictions
+    save(df_full_temp, file = paste0(dir_Konrad, "/data/predictions/Asia/", toString(i), ".Rda"))
+
+}
